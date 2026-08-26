@@ -1,651 +1,777 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import io
+import re
 import unicodedata
 from datetime import datetime
 
-# ==========================================
-# 1. CONFIGURAÇÃO DA PÁGINA E ESTILOS CSS
-# ==========================================
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
 st.set_page_config(
-    page_title="Sistema de Gestão Financeira Condominial",
+    page_title="San Remo • Gestão Condominial",
     page_icon="🏢",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Estilização CSS personalizada para visual executivo
-st.markdown("""
-<style>
-    /* Estilo geral da página */
-    .main {
-        background-color: #f8fafc;
-    }
-    
-    /* Enfatizar KPIs */
-    div[data-testid="stMetricValue"] {
-        font-size: 28px !important;
-        font-weight: 700 !important;
-    }
-    
-    /* Estilo de cartões customizados */
-    .metric-card {
-        background-color: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 10px;
-        padding: 18px;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
-    }
-    
-    /* Abas de navegação */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-    }
-    
-    .stTabs [data-baseweb="tab"] {
-        height: 48px;
-        white-space: pre-wrap;
-        background-color: #ffffff;
-        border-radius: 8px 8px 0px 0px;
-        border: 1px solid #e2e8f0;
-        padding: 10px 20px;
-        font-weight: 600;
-    }
+st.title("🏢 San Remo • Gestão Financeira Condominial")
+st.caption("Painel completo para análise de extratos, despesas, receitas, funcionários e relatórios mensais.")
 
-    .stTabs [aria-selected="true"] {
-        background-color: #1e293b !important;
-        color: #ffffff !important;
-    }
+# ============================================================
+# FUNÇÕES AUXILIARES
+# ============================================================
+def normalizar_texto(valor):
+    if pd.isna(valor):
+        return ""
+    texto = str(valor).strip().lower()
+    texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
+    return texto
 
-    /* Tabelas limpas */
-    .dataframe {
-        font-size: 14px !important;
-    }
-</style>
-""", unsafe_allow_html=True)
+def dinheiro(valor):
+    try:
+        return f"R$ {float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return "R$ 0,00"
 
+def limpar_valor(serie):
+    if pd.api.types.is_numeric_dtype(serie):
+        return pd.to_numeric(serie, errors="coerce")
 
-# ==========================================
-# 2. MOTOR DE TRATAMENTO E CATEGORIZAÇÃO
-# ==========================================
+    s = serie.astype(str).str.strip()
+    s = s.str.replace("R$", "", regex=False).str.replace(" ", "", regex=False)
+    # Trata formatos brasileiros e números já decimais
+    s = s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce")
 
-REGRAS_CATEGORIZACAO_PADRAO = {
-    "Consumo - Água e Esgoto": ["SABESP", "ÁGUA", "AGUA", "DAAE", "SANEAMENTO"],
-    "Consumo - Energia Elétrica": ["ENEL", "CPFL", "LIGHT", "ELETRO", "ENERGIA", "CEMIG"],
-    "Manutenção - Elevadores": ["OTIS", "ATLAS", "SCHINDLER", "ELEVADOR", "THYSSEN"],
-    "Manutenção - Portões e Segurança": ["PORTAO", "CÂMERA", "CAMERA", "ALARME", "SEGURANCA", "SEGURANÇA", "CFTV"],
-    "Serviços Terceirizados - Portaria e Limpeza": ["PORTARIA", "LIMPEZA", "FACILITIES", "CONSERVAÇÃO", "TERCEIRIZADO"],
-    "Despesas Administrativas - Admin/Síndico": ["ADMINISTRADORA", "HONORÁRIOS", "HONORARIOS", "SÍNDICO", "SINDICO", "CONTABILIDADE"],
-    "Despesas Financeiras - Tarifas Bancárias": ["TARIFA", "TAXA BANCO", "MANUTENCAO CONTA", "PIX TARIFA", "IOF", "BANCO"],
-    "Pessoal - Folha e Encargos": ["SALARIO", "FOLHA", "FGTS", "INSS", "PIS", "VALE REFEICAO", "VT", "BENEFICIO"],
-    "Receitas - Cota Condominial": ["CONDOMINIO", "COTA CONDOMINIAL", "TAXA ORDINARIA", "BOLETO", "TAXA CONDOMINIO"],
-    "Receitas - Fundo de Reserva": ["FUNDO DE RESERVA", "FUNDO RESERVA"],
-    "Receitas - Uso de Áreas Comuns": ["SALÃO DE FESTAS", "CHURRASQUEIRA", "SALAO DE FESTAS", "LOCAÇÃO"],
-    "Receitas - Juros e Multas": ["JUROS", "MULTA", "MORA", "ACRÉSCIMO"]
+def encontrar_coluna(df, nomes):
+    mapa = {normalizar_texto(c): c for c in df.columns}
+    for nome in nomes:
+        chave = normalizar_texto(nome)
+        if chave in mapa:
+            return mapa[chave]
+    for c in df.columns:
+        nc = normalizar_texto(c)
+        if any(normalizar_texto(n) in nc for n in nomes):
+            return c
+    return None
+
+# ============================================================
+# CLASSIFICAÇÃO AUTOMÁTICA
+# ============================================================
+REGRAS = {
+    "Consumo - Água": [
+        "sabesp", "saae", "agua", "saneamento", "esgoto"
+    ],
+    "Consumo - Energia": [
+        "enel", "edp", "elektro", "energia eletrica", "energia"
+    ],
+    "Consumo - Gás": [
+        "comgas", "gas natural", "gas encanado", "gas"
+    ],
+    "Consumo - Telefone/Internet": [
+        "vivo", "claro", "tim", "oi ", "telefonia", "internet", "fibra", "telefon"
+    ],
+    "Salários": [
+        "salario", "salários", "folha", "pagamento funcionario", "pagamento de funcionario",
+        "pro labore", "pro-labore"
+    ],
+    "Funcionários - Encargos": [
+        "fgts", "inss", "gps", "e-social", "esocial", "irrf", "contribuicao previdenciaria"
+    ],
+    "Funcionários - Benefícios": [
+        "vale transporte", "vale transporte", "vt ", "vale refeicao", "vale alimentacao",
+        "alelo", "ticket", "cesta basica", "beneficio"
+    ],
+    "Funcionários - Férias/13º": [
+        "ferias", "férias", "decimo terceiro", "13 salario", "13º", "abono"
+    ],
+    "Funcionários - Rescisões": [
+        "rescisao", "rescisão", "multa fgts", "aviso previo", "aviso prévio"
+    ],
+    "Terceirização - Portaria/Segurança": [
+        "portaria", "seguranca", "segurança", "vigilancia", "vigia", "controlador de acesso"
+    ],
+    "Terceirização - Limpeza": [
+        "limpeza terceirizada", "conservacao", "conservação", "asseio", "limpeza"
+    ],
+    "Administradora": [
+        "administradora", "assessoria condominial", "gestao condominial", "gestão condominial"
+    ],
+    "Garantidora": [
+        "garantidora", "garantia de recebiveis", "garantia de recebíveis"
+    ],
+    "Elevadores": [
+        "elevador", "elevadores", "qualita", "manutencao elevador"
+    ],
+    "Manutenção": [
+        "manutencao", "manutenção", "conserto", "reparo", "assistencia tecnica", "assistência técnica"
+    ],
+    "Limpeza/Material": [
+        "material de limpeza", "produto de limpeza", "detergente", "desinfetante", "saco de lixo"
+    ],
+    "Jardinagem": [
+        "jardinagem", "jardim", "paisagismo", "poda"
+    ],
+    "Piscina": [
+        "piscina", "cloro", "tratamento piscina"
+    ],
+    "Segurança Eletrônica": [
+        "intelbras", "cftv", "camera", "câmera", "alarme", "monitoramento"
+    ],
+    "Elevadores/Equipamentos": [
+        "bomba", "motor", "gerador", "equipamento"
+    ],
+    "Obras/Reformas": [
+        "obra", "reforma", "pintura", "impermeabilizacao", "impermeabilização", "construcao"
+    ],
+    "Seguros": [
+        "seguro", "apolice", "apólice"
+    ],
+    "Impostos/Taxas": [
+        "tributo", "imposto", "taxa", "iss", "darf", "prefeitura"
+    ],
+    "Bancárias": [
+        "tarifa bancaria", "tarifa bancária", "tarifa", "banco", "ted", "pix tarifa"
+    ],
+    "Jurídico": [
+        "advogado", "advocacia", "juridico", "jurídico", "processo"
+    ],
+    "Contabilidade": [
+        "contabilidade", "contador", "contabil"
+    ],
 }
 
-def auto_categorizar(descricao, valor_tipo):
-    """Categoriza automaticamente o lançamento com base na descrição."""
-    if not isinstance(descricao, str):
-        return "Outras Despesas" if valor_tipo == "Saída" else "Outras Receitas"
-    
-    desc_upper = descricao.upper()
-    for cat, keywords in REGRAS_CATEGORIZACAO_PADRAO.items():
-        for kw in keywords:
-            if kw in desc_upper:
-                return cat
-                
-    return "Despesas Diversas" if valor_tipo == "Saída" else "Receitas Diversas"
-
-
-def normalizar_dataframe(df):
-    """Mapeia e padroniza colunas do Excel/CSV carregado com busca robusta sem problemas de acento."""
-    df.columns = [str(col).strip() for col in df.columns]
-    
-    def simplificar(texto):
-        texto_norm = unicodedata.normalize('NFD', str(texto))
-        return "".join(c for c in texto_norm if unicodedata.category(c) != 'Mn').lower()
-
-    cols_map = {col: simplificar(col) for col in df.columns}
-    
-    # Mapeamento flexível de colunas
-    col_data = next((col for col, s in cols_map.items() if any(x in s for x in ['data', 'dt', 'vencimento', 'periodo'])), None)
-    col_desc = next((col for col, s in cols_map.items() if any(x in s for x in ['desc', 'historico', 'lancamento', 'detalhe', 'especificacao', 'histor'])), None)
-    col_valor = next((col for col, s in cols_map.items() if any(x in s for x in ['valor', 'val', 'quantia', 'monto', 'saldo'])), None)
-    col_tipo = next((col for col, s in cols_map.items() if any(x in s for x in ['tipo', 'natureza', 'operacao', 'e/s', 'cred/deb', 'd/c'])), None)
-    col_razao = next((col for col, s in cols_map.items() if any(x in s for x in ['razao', 'nome', 'favorecido', 'pagador', 'recebedor', 'fornecedor', 'cliente'])), None)
-    col_cnpj = next((col for col, s in cols_map.items() if any(x in s for x in ['cnpj', 'cpf', 'documento', 'doc'])), None)
-    col_cat = next((col for col, s in cols_map.items() if any(x in s for x in ['categoria', 'conta', 'grupo', 'rubrica'])), None)
-
-    df_norm = pd.DataFrame()
-
-    # Processamento de Data
-    if col_data:
-        df_norm['Data'] = pd.to_datetime(df[col_data], errors='coerce').dt.date
-    else:
-        df_norm['Data'] = datetime.now().date()
-
-    # Processamento de Descrição
-    df_norm['Descrição'] = df[col_desc].astype(str) if col_desc else "Lançamento sem descrição"
-
-    # Processamento de Razão Social
-    df_norm['Razão Social'] = df[col_razao].astype(str) if col_razao else "Não Informado"
-    df_norm['CNPJ/CPF'] = df[col_cnpj].astype(str) if col_cnpj else "-"
-
-    # Processamento de Valor
-    if col_valor:
-        if df[col_valor].dtype == object:
-            v_clean = df[col_valor].astype(str).str.replace('R$', '', regex=False).str.strip()
-            v_clean = v_clean.str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
-            df_norm['Valor_Orig'] = pd.to_numeric(v_clean, errors='coerce').fillna(0.0)
-        else:
-            df_norm['Valor_Orig'] = df[col_valor].fillna(0.0)
-    else:
-        df_norm['Valor_Orig'] = 0.0
-
-    # Processamento de Tipo (Entrada/Saída)
-    if col_tipo:
-        def classificar_tipo(val):
-            v_str = simplificar(val)
-            if any(w in v_str for w in ['entrada', 'credito', 'receita', 'cota', 'deposito']):
-                return 'Entrada'
-            elif any(w in v_str for w in ['saida', 'debito', 'despesa', 'pagamento']):
-                return 'Saída'
-            elif v_str in ['c', 'e']:
-                return 'Entrada'
-            elif v_str in ['d', 's']:
-                return 'Saída'
-            return 'Saída'
-        
-        df_norm['Tipo'] = df[col_tipo].apply(classificar_tipo)
-    elif (df_norm['Valor_Orig'] < 0).any():
-        df_norm['Tipo'] = np.where(df_norm['Valor_Orig'] < 0, 'Saída', 'Entrada')
-    else:
-        def inferir_tipo_por_texto(row):
-            texto_completo = f"{row['Descrição']} {row['Razão Social']}".upper()
-            palavras_receita = ['CONDOMINIO', 'COTA', 'BOLETO', 'RECEITA', 'FUNDO DE RESERVA', 'TAXA', 'ACRESCIMO', 'JUROS', 'MULTA']
-            if any(p in texto_completo for p in palavras_receita):
-                return 'Entrada'
-            return 'Saída'
-
-        df_norm['Tipo'] = df_norm.apply(inferir_tipo_por_texto, axis=1)
-
-    df_norm['Valor'] = df_norm['Valor_Orig'].abs()
-    df_norm.drop(columns=['Valor_Orig'], inplace=True)
-
-    # Processamento de Categoria
-    if col_cat:
-        df_norm['Categoria'] = df[col_cat].astype(str)
-    else:
-        df_norm['Categoria'] = [auto_categorizar(desc, tipo) for desc, tipo in zip(df_norm['Descrição'], df_norm['Tipo'])]
-
-    # Ano e Mês para Agrupamentos
-    df_norm['Ano_Mês'] = pd.to_datetime(df_norm['Data']).dt.strftime('%Y-%m')
-
-    return df_norm
-
-
-@st.cache_data
-def gerar_dados_exemplo():
-    """Gera um extrato demonstrativo completo caso o usuário não tenha arquivo no momento."""
-    datas = pd.date_range(start="2026-01-01", end="2026-08-15", freq="D")
-    data_list = []
-    
-    for d in datas:
-        if d.day == 10:
-            data_list.append({
-                'Data': d.strftime('%Y-%m-%d'),
-                'Descrição': 'Recebimento Cota Condominial Mês',
-                'Tipo': 'Entrada',
-                'Valor': 48500.00,
-                'Razão Social': 'Condôminos Diversos',
-                'CNPJ/CPF': '00.000.000/0001-00',
-                'Categoria': 'Receitas - Cota Condominial'
-            })
-            data_list.append({
-                'Data': d.strftime('%Y-%m-%d'),
-                'Descrição': 'Arrecadação Fundo de Reserva',
-                'Tipo': 'Entrada',
-                'Valor': 4850.00,
-                'Razão Social': 'Condôminos Diversos',
-                'CNPJ/CPF': '00.000.000/0001-00',
-                'Categoria': 'Receitas - Fundo de Reserva'
-            })
-
-        if d.day == 5:
-            data_list.append({
-                'Data': d.strftime('%Y-%m-%d'),
-                'Descrição': 'Pagamento Folha Salarial Portaria/Zeladoria',
-                'Tipo': 'Saída',
-                'Valor': 18200.00,
-                'Razão Social': 'Funcionários Próprios',
-                'CNPJ/CPF': '-',
-                'Categoria': 'Pessoal - Folha e Encargos'
-            })
-        if d.day == 12:
-            data_list.append({
-                'Data': d.strftime('%Y-%m-%d'),
-                'Descrição': 'Fatura Energia Elétrica Áreas Comuns',
-                'Tipo': 'Saída',
-                'Valor': 3450.80,
-                'Razão Social': 'ENEL Distribuição SP',
-                'CNPJ/CPF': '61.695.227/0001-93',
-                'Categoria': 'Consumo - Energia Elétrica'
-            })
-        if d.day == 15:
-            data_list.append({
-                'Data': d.strftime('%Y-%m-%d'),
-                'Descrição': 'Manutenção Mensal Elevadores OTIS',
-                'Tipo': 'Saída',
-                'Valor': 2800.00,
-                'Razão Social': 'Elevadores Otis Ltda',
-                'CNPJ/CPF': '29.225.096/0001-63',
-                'Categoria': 'Manutenção - Elevadores'
-            })
-        if d.day == 20:
-            data_list.append({
-                'Data': d.strftime('%Y-%m-%d'),
-                'Descrição': 'Fatura Água e Esgoto SABESP',
-                'Tipo': 'Saída',
-                'Valor': 4120.30,
-                'Razão Social': 'SABESP',
-                'CNPJ/CPF': '43.776.517/0001-80',
-                'Categoria': 'Consumo - Água e Esgoto'
-            })
-        if d.day == 25:
-            data_list.append({
-                'Data': d.strftime('%Y-%m-%d'),
-                'Descrição': 'Honorários Administradora de Condomínios',
-                'Tipo': 'Saída',
-                'Valor': 3500.00,
-                'Razão Social': 'Alfa Gestão Condominial',
-                'CNPJ/CPF': '12.345.678/0001-90',
-                'Categoria': 'Despesas Administrativas - Admin/Síndico'
-            })
-
-    return pd.DataFrame(data_list)
-
-
-# ==========================================
-# 3. INTERFACE E BARRA LATERAL (SIDEBAR)
-# ==========================================
-# ==========================================
-# CONEXÃO COM O GOOGLE DRIVE
-# ==========================================
-
-# Cole aqui a URL de download direto montada no Passo 2
-URL_GOOGLE_DRIVE = "https://drive.google.com/uc?export=download&id=1BTYPtjBHLLvSXHH_IfKrnqqwVQZ4hh4T"
-
-@st.cache_data(ttl=300)  # Recarrega os dados do Drive a cada 5 minutos
-def carregar_dados_do_drive(url):
-    try:
-        # Tenta ler como Excel primeiro; se falhar, tenta como CSV
-        try:
-            df = pd.read_excel(url)
-        except Exception:
-            df = pd.read_csv(url)
-        return normalizar_dataframe(df)
-    except Exception as e:
-        st.error(f"Erro ao carregar planilha do Google Drive: {e}")
-        return None
-
-# --- BARRA LATERAL PARA SELEÇÃO DE FONTE DE DADOS ---
-st.sidebar.subheader("📁 Fonte de Dados")
-fonte_dados = st.sidebar.radio(
-    "Como deseja carregar as informações?",
-    ["Google Drive (Automático)", "Fazer Upload de Arquivo"]
-)
-
-if fonte_dados == "Google Drive (Automático)":
-    if st.sidebar.button("🔄 Atualizar Dados do Drive"):
-        st.cache_data.clear()  # Limpa o cache para buscar a versão mais recente
-    
-    df_dados = carregar_dados_do_drive(URL_GOOGLE_DRIVE)
-    
-    # CORREÇÃO AQUI: 'is None or' em vez de 'is me ou'
-    if df_dados is None or df_dados.empty:
-        st.warning("Exibindo dados demonstrativos enquanto a planilha do Drive não for configurada.")
-        df_dados = normalizar_dataframe(gerar_dados_exemplo())
-else:
-    arquivo_uploaded = st.sidebar.file_uploader(
-        "Selecione sua planilha Excel (.xlsx) ou CSV",
-        type=["xlsx", "xls", "csv"]
+def classificar_linha(row, colunas_texto):
+    texto = " ".join(
+        normalizar_texto(row.get(c, ""))
+        for c in colunas_texto
+        if c in row.index
     )
-    if arquivo_uploaded is not None:
-        if arquivo_uploaded.name.endswith('.csv'):
-            df_raw = pd.read_csv(arquivo_uploaded)
-        else:
-            df_raw = pd.read_excel(arquivo_uploaded)
-        df_dados = normalizar_dataframe(df_raw)
-    else:
-        df_dados = normalizar_dataframe(gerar_dados_exemplo())
+    for categoria, palavras in REGRAS.items():
+        for palavra in palavras:
+            if normalizar_texto(palavra) in texto:
+                return categoria
+    return "Outras Despesas" if row.get("Tipo_Calculado") == "Saída" else "Receitas"
 
-#novo acima
+def subcategoria_funcionario(categoria):
+    return categoria if categoria.startswith("Funcionários") or categoria == "Salários" else ""
 
-# --- FILTROS AVANÇADOS NA BARRA LATERAL ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔍 Filtros Globais")
-
-# Filtro de Período
-min_data = df_dados['Data'].min()
-max_data = df_dados['Data'].max()
-
-data_inicio, data_fim = st.sidebar.date_input(
-    "Período de Análise",
-    value=[min_data, max_data],
-    min_value=min_data,
-    max_value=max_data
+# ============================================================
+# LEITURA DO ARQUIVO
+# ============================================================
+uploaded_file = st.sidebar.file_uploader(
+    "📥 Carregue o extrato (.xlsx, .xls ou .csv)",
+    type=["xlsx", "xls", "csv"]
 )
 
-# Filtro Tipo
+if uploaded_file is None:
+    st.info("📌 Carregue o extrato bancário no menu à esquerda para iniciar a análise.")
+    st.markdown("""
+### O que este painel faz
+- 📅 Relatório por mês
+- 💧 Contas de consumo separadas
+- 👷 Salários e todas as despesas de funcionários
+- 🧾 Encargos, benefícios, férias, 13º e rescisões
+- 🔎 Pesquisa por fornecedor, CNPJ/CPF, descrição, lançamento e categoria
+- 📊 Gráficos e ranking de despesas
+- 💰 Comparação de receitas x despesas
+- 📤 Exportação dos dados filtrados para Excel e CSV
+- 🧠 Classificação automática das despesas
+- ✏️ Ajuste manual da categoria dos lançamentos
+""")
+    st.stop()
+
+try:
+    if uploaded_file.name.lower().endswith(".csv"):
+        df = pd.read_csv(uploaded_file, sep=None, engine="python")
+    else:
+        df = pd.read_excel(uploaded_file)
+except Exception as e:
+    st.error(f"Não foi possível ler o arquivo: {e}")
+    st.stop()
+
+df.columns = [str(c).strip() for c in df.columns]
+
+# ============================================================
+# IDENTIFICAÇÃO DAS COLUNAS
+# ============================================================
+col_valor = encontrar_coluna(df, ["valor", "valor r$", "valor (r$)", "amount"])
+col_data = encontrar_coluna(df, ["data", "data lançamento", "data lancamento", "date"])
+
+if not col_valor:
+    st.error("❌ Não encontrei a coluna de valor. Renomeie a coluna para 'Valor' e tente novamente.")
+    st.write("Colunas encontradas:", list(df.columns))
+    st.stop()
+
+df[col_valor] = limpar_valor(df[col_valor])
+df = df.dropna(subset=[col_valor]).copy()
+
+if col_data:
+    df["Data_Analise"] = pd.to_datetime(df[col_data], dayfirst=True, errors="coerce")
+else:
+    df["Data_Analise"] = pd.NaT
+
+df["Tipo_Calculado"] = df[col_valor].apply(
+    lambda x: "Entrada" if x > 0 else ("Saída" if x < 0 else "Neutro")
+)
+df["Valor_Absoluto"] = df[col_valor].abs()
+
+# Colunas textuais úteis para classificação e pesquisa
+colunas_texto = [
+    c for c in [
+        encontrar_coluna(df, ["lançamento", "lancamento", "histórico", "historico"]),
+        encontrar_coluna(df, ["razão social", "razao social", "fornecedor", "favorecido"]),
+        encontrar_coluna(df, ["cpf/cnpj", "cpf", "cnpj", "documento"]),
+        encontrar_coluna(df, ["descrição", "descricao", "histórico", "historico"]),
+        encontrar_coluna(df, ["complemento"]),
+    ] if c
+]
+colunas_texto = list(dict.fromkeys(colunas_texto))
+
+df["Categoria_Automatica"] = df.apply(
+    lambda row: classificar_linha(row, colunas_texto),
+    axis=1
+)
+df["Categoria"] = df["Categoria_Automatica"]
+df["Mes"] = df["Data_Analise"].dt.to_period("M").astype(str)
+df.loc[df["Mes"] == "NaT", "Mes"] = "Sem data"
+
+# ============================================================
+# FILTROS
+# ============================================================
+st.sidebar.header("🔍 Filtros avançados")
+
 tipos = ["Todos", "Entrada", "Saída"]
-tipo_sel = st.sidebar.selectbox("Tipo de Operação", tipos)
+tipo = st.sidebar.selectbox("Tipo de lançamento", tipos)
 
-# Filtro de Categorias
-categorias_disponiveis = ["Todas"] + sorted(list(df_dados['Categoria'].unique()))
-categoria_sel = st.sidebar.selectbox("Categoria / Conta", categorias_disponiveis)
+categorias = sorted(df["Categoria"].dropna().unique().tolist())
+categorias_sel = st.sidebar.multiselect(
+    "Categoria",
+    categorias,
+    default=[]
+)
 
-# Filtro de Busca Por Texto
-busca_termo = st.sidebar.text_input("Buscar Fornecedor, CNPJ ou Histórico", "").strip()
+meses = sorted(df["Mes"].dropna().unique().tolist())
+meses_sel = st.sidebar.multiselect(
+    "Mês",
+    meses,
+    default=[]
+)
 
-# Aplicação dos Filtros
-df_filtrado = df_dados.copy()
-df_filtrado = df_filtrado[(df_filtrado['Data'] >= data_inicio) & (df_filtrado['Data'] <= data_fim)]
+busca = st.sidebar.text_input(
+    "🔎 Pesquisa geral",
+    placeholder="Fornecedor, CNPJ, descrição, lançamento..."
+)
 
-if tipo_sel != "Todos":
-    df_filtrado = df_filtrado[df_filtrado['Tipo'] == tipo_sel]
+valor_min = float(df["Valor_Absoluto"].min()) if len(df) else 0
+valor_max = float(df["Valor_Absoluto"].max()) if len(df) else 0
+faixa = st.sidebar.slider(
+    "Faixa de valor (R$)",
+    min_value=0.0,
+    max_value=max(valor_max, 1.0),
+    value=(0.0, max(valor_max, 1.0)),
+    step=max(max(valor_max, 1.0) / 100, 0.01)
+)
 
-if categoria_sel != "Todas":
-    df_filtrado = df_filtrado[df_filtrado['Categoria'] == categoria_sel]
+somente_func = st.sidebar.checkbox("👷 Somente despesas de funcionários")
+somente_consumo = st.sidebar.checkbox("💡 Somente contas de consumo")
 
-if busca_termo:
+st.sidebar.markdown("---")
+st.sidebar.caption("Categorias automáticas podem ser ajustadas na aba 'Classificação'.")
+
+# ============================================================
+# APLICAÇÃO DOS FILTROS
+# ============================================================
+df_filtrado = df.copy()
+
+if tipo != "Todos":
+    df_filtrado = df_filtrado[df_filtrado["Tipo_Calculado"] == tipo]
+
+if categorias_sel:
+    df_filtrado = df_filtrado[df_filtrado["Categoria"].isin(categorias_sel)]
+
+if meses_sel:
+    df_filtrado = df_filtrado[df_filtrado["Mes"].isin(meses_sel)]
+
+if busca:
+    mascara = pd.Series(False, index=df_filtrado.index)
+    cols_busca = list(dict.fromkeys(colunas_texto + ["Categoria"]))
+    for c in cols_busca:
+        if c in df_filtrado.columns:
+            mascara |= df_filtrado[c].astype(str).str.contains(
+                busca, case=False, na=False, regex=False
+            )
+    df_filtrado = df_filtrado[mascara]
+
+df_filtrado = df_filtrado[
+    (df_filtrado["Valor_Absoluto"] >= faixa[0]) &
+    (df_filtrado["Valor_Absoluto"] <= faixa[1])
+]
+
+if somente_func:
     mask = (
-        df_filtrado['Razão Social'].str.contains(busca_termo, case=False, na=False) |
-        df_filtrado['CNPJ/CPF'].str.contains(busca_termo, case=False, na=False) |
-        df_filtrado['Descrição'].str.contains(busca_termo, case=False, na=False)
+        df_filtrado["Categoria"].str.contains(
+            "Salários|Funcionários", case=False, na=False, regex=True
+        )
     )
     df_filtrado = df_filtrado[mask]
 
+if somente_consumo:
+    mask = df_filtrado["Categoria"].str.startswith("Consumo", na=False)
+    df_filtrado = df_filtrado[mask]
 
-# ==========================================
-# 4. PAINEL PRINCIPAL E NAVEGAÇÃO POR ABAS
-# ==========================================
+# ============================================================
+# KPIs
+# ============================================================
+total_entradas = df_filtrado.loc[
+    df_filtrado["Tipo_Calculado"] == "Entrada", col_valor
+].sum()
 
-st.title("🏢 Sistema Executivo de Gestão de Condomínio")
-st.markdown(f"**Análise de Lançamentos:** de `{data_inicio.strftime('%d/%m/%Y')}` até `{data_fim.strftime('%d/%m/%Y')}`")
+total_saidas = df_filtrado.loc[
+    df_filtrado["Tipo_Calculado"] == "Saída", col_valor
+].abs().sum()
 
-aba1, aba2, aba3, aba4, aba5 = st.tabs([
-    "📊 Dashboard Executivo",
-    "📑 Balancete & DRE Condominial",
-    "🏭 Curva ABC de Fornecedores",
-    "🎯 Orçamento x Realizado",
-    "📋 Tabela de Lançamentos & Exportação"
+saldo = total_entradas - total_saidas
+
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("💰 Entradas", dinheiro(total_entradas))
+c2.metric("💸 Despesas", dinheiro(total_saidas))
+c3.metric("📈 Resultado", dinheiro(saldo))
+c4.metric("📋 Lançamentos", f"{len(df_filtrado):,}".replace(",", "."))
+c5.metric("👷 Funcionários", dinheiro(
+    df_filtrado[
+        df_filtrado["Categoria"].str.contains("Salários|Funcionários", case=False, na=False)
+    ]["Valor_Absoluto"].sum()
+))
+
+# ============================================================
+# ABAS
+# ============================================================
+tab_dashboard, tab_mensal, tab_func, tab_consumo, tab_despesas, tab_pesquisa, tab_class, tab_dados = st.tabs([
+    "📊 Dashboard",
+    "📅 Relatório Mensal",
+    "👷 Funcionários",
+    "💡 Consumo",
+    "💸 Despesas",
+    "🔎 Pesquisa",
+    "🧠 Classificação",
+    "📋 Dados"
 ])
 
+# ============================================================
+# DASHBOARD
+# ============================================================
+with tab_dashboard:
+    st.subheader("Visão geral")
 
-# ------------------------------------------
-# ABA 1: DASHBOARD EXECUTIVO
-# ------------------------------------------
-with aba1:
-    tot_entradas = df_filtrado[df_filtrado['Tipo'] == 'Entrada']['Valor'].sum()
-    tot_saidas = df_filtrado[df_filtrado['Tipo'] == 'Saída']['Valor'].sum()
-    resultado_liquido = tot_entradas - tot_saidas
-    taxa_cobertura = (tot_entradas / tot_saidas * 100) if tot_saidas > 0 else 100
+    if df_filtrado.empty:
+        st.warning("Nenhum lançamento corresponde aos filtros.")
+    else:
+        col_a, col_b = st.columns(2)
 
-    col_kpi1, col_kpi2, col_kpi3, col_kpi4 = st.columns(4)
-
-    with col_kpi1:
-        st.metric("Total de Receitas (Entradas)", f"R$ {tot_entradas:,.2f}", delta=f"{len(df_filtrado[df_filtrado['Tipo']=='Entrada'])} lançamentos")
-    with col_kpi2:
-        st.metric("Total de Despesas (Saídas)", f"R$ {tot_saidas:,.2f}", delta=f"-{len(df_filtrado[df_filtrado['Tipo']=='Saída'])} lançamentos", delta_color="inverse")
-    with col_kpi3:
-        cor_delta = "normal" if resultado_liquido >= 0 else "inverse"
-        st.metric("Resultado Líquido do Período", f"R$ {resultado_liquido:,.2f}", delta=f"{'Superávit' if resultado_liquido>=0 else 'Déficit'}", delta_color=cor_delta)
-    with col_kpi4:
-        st.metric("Índice de Cobertura Financeira", f"{taxa_cobertura:.1f}%", help="Percentual de receitas que cobrem as despesas atuais.")
-
-    st.markdown("---")
-
-    col_graf1, col_graf2 = st.columns([6, 4])
-
-    with col_graf1:
-        st.subheader("📈 Evolução Mensal do Fluxo de Caixa")
-        df_mensal = df_filtrado.groupby(['Ano_Mês', 'Tipo'])['Valor'].sum().reset_index()
-        
-        if not df_mensal.empty:
-            fig_bar = px.bar(
-                df_mensal,
-                x='Ano_Mês',
-                y='Valor',
-                color='Tipo',
-                barmode='group',
-                color_discrete_map={'Entrada': '#10b981', 'Saída': '#ef4444'},
-                labels={'Ano_Mês': 'Mês/Ano', 'Valor': 'Total (R$)'},
-                text_auto='.2s'
+        with col_a:
+            resumo_tipo = (
+                df_filtrado.groupby("Tipo_Calculado")["Valor_Absoluto"]
+                .sum()
+                .reset_index()
             )
-            fig_bar.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10))
-            st.plotly_chart(fig_bar, use_container_width=True)
-        else:
-            st.info("Nenhum dado encontrado para o período selecionado.")
-
-    with col_graf2:
-        st.subheader("🍕 Distribuição de Despesas por Categoria")
-        df_saidas_cat = df_filtrado[df_filtrado['Tipo'] == 'Saída'].groupby('Categoria')['Valor'].sum().reset_index()
-        
-        if not df_saidas_cat.empty:
-            fig_pie = px.pie(
-                df_saidas_cat,
-                values='Valor',
-                names='Categoria',
-                hole=0.4,
-                color_discrete_sequence=px.colors.qualitative.Pastel
+            fig = px.pie(
+                resumo_tipo,
+                names="Tipo_Calculado",
+                values="Valor_Absoluto",
+                hole=0.45,
+                title="Entradas x Saídas"
             )
-            fig_pie.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10))
-            st.plotly_chart(fig_pie, use_container_width=True)
-        else:
-            st.info("Sem despesas no período selecionado.")
+            st.plotly_chart(fig, use_container_width=True)
 
-
-# ------------------------------------------
-# ABA 2: BALANCETE & DRE CONDOMINIAL
-# ------------------------------------------
-with aba2:
-    st.subheader("📑 Demonstrativo de Prestação de Contas (Balancete Sintético)")
-    st.caption("Estrutura no padrão oficial utilizado em assembleias ordinárias de condomínio.")
-
-    dre_entradas = df_filtrado[df_filtrado['Tipo'] == 'Entrada'].groupby('Categoria')['Valor'].agg(['sum', 'count']).reset_index()
-    dre_entradas.columns = ['Categoria / Rubrica', 'Valor Total (R$)', 'Qtd. Lançamentos']
-    
-    dre_saidas = df_filtrado[df_filtrado['Tipo'] == 'Saída'].groupby('Categoria')['Valor'].agg(['sum', 'count']).reset_index()
-    dre_saidas.columns = ['Categoria / Rubrica', 'Valor Total (R$)', 'Qtd. Lançamentos']
-
-    col_dre1, col_dre2 = st.columns(2)
-
-    with col_dre1:
-        st.markdown("### 🟢 RECEITAS (Entradas)")
-        if not dre_entradas.empty:
-            st.dataframe(
-                dre_entradas.style.format({'Valor Total (R$)': 'R$ {:,.2f}'}),
-                use_container_width=True,
-                hide_index=True
+        with col_b:
+            saidas_cat = (
+                df_filtrado[df_filtrado["Tipo_Calculado"] == "Saída"]
+                .groupby("Categoria")["Valor_Absoluto"]
+                .sum()
+                .reset_index()
+                .sort_values("Valor_Absoluto", ascending=False)
+                .head(12)
             )
-            st.markdown(f"**Total de Receitas:** `R$ {dre_entradas['Valor Total (R$)'].sum():,.2f}`")
-        else:
-            st.info("Nenhuma receita registrada no período.")
-
-    with col_dre2:
-        st.markdown("### 🔴 DESPESAS (Saídas)")
-        if not dre_saidas.empty:
-            st.dataframe(
-                dre_saidas.style.format({'Valor Total (R$)': 'R$ {:,.2f}'}),
-                use_container_width=True,
-                hide_index=True
+            fig = px.bar(
+                saidas_cat,
+                x="Valor_Absoluto",
+                y="Categoria",
+                orientation="h",
+                title="Principais categorias de despesas"
             )
-            st.markdown(f"**Total de Despesas:** `R$ {dre_saidas['Valor Total (R$)'].sum():,.2f}`")
-        else:
-            st.info("Nenhuma despesa registrada no período.")
+            st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("---")
-    
-    col_res1, col_res2, col_res3 = st.columns(3)
-    col_res1.metric("(=) Total de Entradas", f"R$ {tot_entradas:,.2f}")
-    col_res2.metric("(-) Total de Saídas", f"R$ {tot_saidas:,.2f}")
-    col_res3.metric("(=) Saldo Operacional do Período", f"R$ {resultado_liquido:,.2f}")
-
-
-# ------------------------------------------
-# ABA 3: CURVA ABC DE FORNECEDORES
-# ------------------------------------------
-with aba3:
-    st.subheader("🏭 Análise de Fornecedores, Prestadores e Favorecidos")
-    st.markdown("Identifique onde está concentrada a maior parte dos pagamentos do condomínio (Curva Pareto 80/20).")
-
-    df_fornecedores = df_filtrado[df_filtrado['Tipo'] == 'Saída'].groupby(['Razão Social', 'CNPJ/CPF'])['Valor'].agg(['sum', 'count']).reset_index()
-    df_fornecedores.columns = ['Razão Social / Favorecido', 'CNPJ / CPF', 'Total Pago (R$)', 'Nº de Pagamentos']
-    df_fornecedores = df_fornecedores.sort_values(by='Total Pago (R$)', ascending=False)
-
-    if not df_fornecedores.empty:
-        tot_gastos = df_fornecedores['Total Pago (R$)'].sum()
-        df_fornecedores['% do Total'] = (df_fornecedores['Total Pago (R$)'] / tot_gastos) * 100
-        df_fornecedores['% Acumulada'] = df_fornecedores['% do Total'].cumsum()
-
-        df_fornecedores['Classificação'] = np.where(df_fornecedores['% Acumulada'] <= 70, 'Classe A (Alto Impacto)',
-                                            np.where(df_fornecedores['% Acumulada'] <= 90, 'Classe B (Médio Impacto)', 'Classe C (Baixo Impacto)'))
-
-        col_abc1, col_abc2 = st.columns([7, 3])
-
-        with col_abc1:
-            fig_top_forn = px.bar(
-                df_fornecedores.head(10),
-                x='Total Pago (R$)',
-                y='Razão Social / Favorecido',
-                orientation='h',
-                title="Top 10 Fornecedores com Maior Volume de Pagamentos",
-                color='Classificação',
-                color_discrete_map={
-                    'Classe A (Alto Impacto)': '#ef4444',
-                    'Classe B (Médio Impacto)': '#f59e0b',
-                    'Classe C (Baixo Impacto)': '#3b82f6'
-                }
+        if df_filtrado["Data_Analise"].notna().any():
+            mensal = (
+                df_filtrado[df_filtrado["Data_Analise"].notna()]
+                .assign(Mes_dt=df_filtrado["Data_Analise"].dt.to_period("M").dt.to_timestamp())
+                .groupby(["Mes_dt", "Tipo_Calculado"])["Valor_Absoluto"]
+                .sum()
+                .reset_index()
             )
-            fig_top_forn.update_layout(yaxis={'categoryorder':'total ascending'}, height=400)
-            st.plotly_chart(fig_top_forn, use_container_width=True)
+            fig = px.bar(
+                mensal,
+                x="Mes_dt",
+                y="Valor_Absoluto",
+                color="Tipo_Calculado",
+                barmode="group",
+                title="Movimentação por mês"
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-        with col_abc2:
-            st.markdown("#### 💡 Resumo da Curva ABC")
-            qtd_a = len(df_fornecedores[df_fornecedores['Classificação'] == 'Classe A (Alto Impacto)'])
-            val_a = df_fornecedores[df_fornecedores['Classificação'] == 'Classe A (Alto Impacto)']['Total Pago (R$)'].sum()
-            
-            st.info(f"**{qtd_a} fornecedores** representam **70% de todo o custo** do condomínio no período, totalizando **R$ {val_a:,.2f}**.")
+        st.subheader("🏆 Maiores despesas")
+        top = (
+            df_filtrado[df_filtrado["Tipo_Calculado"] == "Saída"]
+            .sort_values("Valor_Absoluto", ascending=False)
+            .head(20)
+            .copy()
+        )
+        if not top.empty:
+            st.dataframe(top, use_container_width=True, hide_index=True)
 
-        st.markdown("#### 📋 Tabela Completa de Fornecedores e Pagadores")
+# ============================================================
+# RELATÓRIO MENSAL
+# ============================================================
+with tab_mensal:
+    st.subheader("📅 Relatório financeiro por mês")
+
+    d = df_filtrado[df_filtrado["Data_Analise"].notna()].copy()
+    if d.empty:
+        st.warning("Não há datas válidas para gerar o relatório mensal.")
+    else:
+        d["Ano_Mes"] = d["Data_Analise"].dt.to_period("M").astype(str)
+
+        mensal = d.groupby("Ano_Mes").apply(
+            lambda g: pd.Series({
+                "Entradas": g.loc[g["Tipo_Calculado"] == "Entrada", col_valor].sum(),
+                "Despesas": g.loc[g["Tipo_Calculado"] == "Saída", col_valor].abs().sum(),
+                "Resultado": (
+                    g.loc[g["Tipo_Calculado"] == "Entrada", col_valor].sum()
+                    - g.loc[g["Tipo_Calculado"] == "Saída", col_valor].abs().sum()
+                ),
+                "Lançamentos": len(g),
+                "Funcionários": g.loc[
+                    g["Categoria"].str.contains("Salários|Funcionários", case=False, na=False),
+                    "Valor_Absoluto"
+                ].sum(),
+                "Consumo": g.loc[
+                    g["Categoria"].str.startswith("Consumo", na=False),
+                    "Valor_Absoluto"
+                ].sum(),
+            })
+        ).reset_index()
+
+        for c in ["Entradas", "Despesas", "Resultado", "Funcionários", "Consumo"]:
+            mensal[c] = mensal[c].astype(float)
+
         st.dataframe(
-            df_fornecedores.style.format({
-                'Total Pago (R$)': 'R$ {:,.2f}',
-                '% do Total': '{:.1f}%',
-                '% Acumulada': '{:.1f}%'
+            mensal.style.format({
+                "Entradas": dinheiro,
+                "Despesas": dinheiro,
+                "Resultado": dinheiro,
+                "Funcionários": dinheiro,
+                "Consumo": dinheiro,
+                "Lançamentos": "{:.0f}"
             }),
             use_container_width=True,
             hide_index=True
         )
+
+        fig = px.line(
+            mensal,
+            x="Ano_Mes",
+            y=["Entradas", "Despesas", "Resultado"],
+            markers=True,
+            title="Evolução mensal"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("📑 Detalhamento do mês")
+        mes_relatorio = st.selectbox("Escolha o mês", sorted(mensal["Ano_Mes"].tolist(), reverse=True))
+        dm = d[d["Ano_Mes"] == mes_relatorio].copy()
+
+        categorias_mes = (
+            dm[dm["Tipo_Calculado"] == "Saída"]
+            .groupby("Categoria")["Valor_Absoluto"]
+            .sum()
+            .reset_index()
+            .sort_values("Valor_Absoluto", ascending=False)
+        )
+        st.dataframe(categorias_mes, use_container_width=True, hide_index=True)
+
+# ============================================================
+# FUNCIONÁRIOS
+# ============================================================
+with tab_func:
+    st.subheader("👷 Despesas de funcionários")
+
+    df_func = df_filtrado[
+        df_filtrado["Categoria"].str.contains(
+            "Salários|Funcionários", case=False, na=False
+        )
+    ].copy()
+
+    if df_func.empty:
+        st.info("Nenhum lançamento de funcionário encontrado nos filtros atuais.")
     else:
-        st.info("Nenhum registro de saída encontrado para os filtros atuais.")
+        salario = df_func[
+            df_func["Categoria"].isin(["Salários"])
+        ]["Valor_Absoluto"].sum()
 
+        encargos = df_func[
+            df_func["Categoria"].eq("Funcionários - Encargos")
+        ]["Valor_Absoluto"].sum()
 
-# ------------------------------------------
-# ABA 4: ORÇAMENTO X REALIZADO
-# ------------------------------------------
-with aba4:
-    st.subheader("🎯 Comparativo de Orçamento Previsto x Gastos Realizados")
-    st.caption("Acompanhe o desvio do orçamento aprovado em assembleia para cada rubrica de despesa.")
+        beneficios = df_func[
+            df_func["Categoria"].eq("Funcionários - Benefícios")
+        ]["Valor_Absoluto"].sum()
 
-    orcamento_estimado = {
-        "Consumo - Água e Esgoto": 4500.00,
-        "Consumo - Energia Elétrica": 3800.00,
-        "Manutenção - Elevadores": 3000.00,
-        "Manutenção - Portões e Segurança": 1500.00,
-        "Serviços Terceirizados - Portaria e Limpeza": 12000.00,
-        "Despesas Administrativas - Admin/Síndico": 3800.00,
-        "Despesas Financeiras - Tarifas Bancárias": 400.00,
-        "Pessoal - Folha e Encargos": 19000.00,
-        "Despesas Diversas": 2000.00
-    }
+        ferias = df_func[
+            df_func["Categoria"].eq("Funcionários - Férias/13º")
+        ]["Valor_Absoluto"].sum()
 
-    gastos_reais = df_filtrado[df_filtrado['Tipo'] == 'Saída'].groupby('Categoria')['Valor'].sum().to_dict()
+        rescisoes = df_func[
+            df_func["Categoria"].eq("Funcionários - Rescisões")
+        ]["Valor_Absoluto"].sum()
 
-    dados_orcamento = []
-    for cat, orc in orcamento_estimado.items():
-        realizado = gastos_reais.get(cat, 0.0)
-        desvio = realizado - orc
-        pct = (realizado / orc * 100) if orc > 0 else 0
-        dados_orcamento.append({
-            'Categoria': cat,
-            'Orçado (R$)': orc,
-            'Realizado (R$)': realizado,
-            'Diferença (R$)': desvio,
-            'Atingido (%)': pct,
-            'Status': '🔴 Estourado' if desvio > 0 else '🟢 Dentro do Limite'
-        })
+        a, b, c, d, e = st.columns(5)
+        a.metric("Salários", dinheiro(salario))
+        b.metric("Encargos", dinheiro(encargos))
+        c.metric("Benefícios", dinheiro(beneficios))
+        d.metric("Férias/13º", dinheiro(ferias))
+        e.metric("Rescisões", dinheiro(rescisoes))
 
-    df_orc = pd.DataFrame(dados_orcamento)
+        resumo_func = (
+            df_func.groupby("Categoria")["Valor_Absoluto"]
+            .sum()
+            .reset_index()
+            .sort_values("Valor_Absoluto", ascending=False)
+        )
 
-    fig_orc = go.Figure()
-    fig_orc.add_trace(go.Bar(x=df_orc['Categoria'], y=df_orc['Orçado (R$)'], name='Orçado Previsto', marker_color='#94a3b8'))
-    fig_orc.add_trace(go.Bar(x=df_orc['Categoria'], y=df_orc['Realizado (R$)'], name='Realizado', marker_color='#3b82f6'))
+        fig = px.bar(
+            resumo_func,
+            x="Categoria",
+            y="Valor_Absoluto",
+            title="Custo dos funcionários por tipo",
+            text_auto=".2f"
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-    fig_orc.update_layout(barmode='group', title="Comparativo Visual: Previsto vs Realizado", height=400)
-    st.plotly_chart(fig_orc, use_container_width=True)
+        if df_func["Data_Analise"].notna().any():
+            func_mes = (
+                df_func[df_func["Data_Analise"].notna()]
+                .assign(Ano_Mes=df_func["Data_Analise"].dt.to_period("M").astype(str))
+                .groupby("Ano_Mes")["Valor_Absoluto"]
+                .sum()
+                .reset_index()
+            )
+            fig = px.bar(func_mes, x="Ano_Mes", y="Valor_Absoluto", title="Custo de funcionários por mês")
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.dataframe(df_func, use_container_width=True, hide_index=True)
+
+# ============================================================
+# CONSUMO
+# ============================================================
+with tab_consumo:
+    st.subheader("💡 Contas de consumo")
+
+    df_cons = df_filtrado[
+        df_filtrado["Categoria"].str.startswith("Consumo", na=False)
+    ].copy()
+
+    if df_cons.empty:
+        st.info("Nenhuma conta de consumo encontrada.")
+    else:
+        consumo = (
+            df_cons.groupby("Categoria")["Valor_Absoluto"]
+            .sum()
+            .reset_index()
+            .sort_values("Valor_Absoluto", ascending=False)
+        )
+
+        st.dataframe(
+            consumo.style.format({"Valor_Absoluto": dinheiro}),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        fig = px.pie(
+            consumo,
+            names="Categoria",
+            values="Valor_Absoluto",
+            hole=0.4,
+            title="Distribuição das contas de consumo"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        if df_cons["Data_Analise"].notna().any():
+            cm = (
+                df_cons[df_cons["Data_Analise"].notna()]
+                .assign(Ano_Mes=df_cons["Data_Analise"].dt.to_period("M").astype(str))
+                .groupby(["Ano_Mes", "Categoria"])["Valor_Absoluto"]
+                .sum()
+                .reset_index()
+            )
+            fig = px.line(
+                cm, x="Ano_Mes", y="Valor_Absoluto", color="Categoria",
+                markers=True, title="Evolução mensal do consumo"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.dataframe(df_cons, use_container_width=True, hide_index=True)
+
+# ============================================================
+# DESPESAS
+# ============================================================
+with tab_despesas:
+    st.subheader("💸 Análise completa das despesas")
+
+    saidas = df_filtrado[df_filtrado["Tipo_Calculado"] == "Saída"].copy()
+
+    if saidas.empty:
+        st.info("Nenhuma despesa encontrada.")
+    else:
+        ranking = (
+            saidas.groupby("Categoria")
+            .agg(
+                Total=("Valor_Absoluto", "sum"),
+                Quantidade=("Valor_Absoluto", "size"),
+                Maior_Lancamento=("Valor_Absoluto", "max")
+            )
+            .reset_index()
+            .sort_values("Total", ascending=False)
+        )
+        ranking["% do total"] = ranking["Total"] / ranking["Total"].sum() * 100
+
+        st.dataframe(
+            ranking.style.format({
+                "Total": dinheiro,
+                "Maior_Lancamento": dinheiro,
+                "% do total": "{:.2f}%"
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        fig = px.bar(
+            ranking.head(15),
+            x="Total",
+            y="Categoria",
+            orientation="h",
+            title="Ranking das despesas"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+# ============================================================
+# PESQUISA
+# ============================================================
+with tab_pesquisa:
+    st.subheader("🔎 Pesquisa detalhada")
+
+    st.write(f"**{len(df_filtrado)} lançamento(s) encontrado(s).**")
+
+    if not df_filtrado.empty:
+        st.dataframe(
+            df_filtrado.sort_values(
+                "Data_Analise", ascending=False, na_position="last"
+            ),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.subheader("🔍 Resumo da pesquisa")
+        res = (
+            df_filtrado.groupby(["Tipo_Calculado", "Categoria"])
+            .agg(
+                Quantidade=(col_valor, "size"),
+                Total=("Valor_Absoluto", "sum")
+            )
+            .reset_index()
+            .sort_values("Total", ascending=False)
+        )
+        st.dataframe(
+            res.style.format({"Total": dinheiro}),
+            use_container_width=True,
+            hide_index=True
+        )
+
+# ============================================================
+# CLASSIFICAÇÃO MANUAL
+# ============================================================
+with tab_class:
+    st.subheader("🧠 Classificação automática e ajuste manual")
+
+    st.write(
+        "O sistema tenta identificar automaticamente fornecedores e descrições. "
+        "Se uma despesa estiver classificada incorretamente, você pode editar a categoria abaixo."
+    )
+
+    categorias_editaveis = sorted(set(REGRAS.keys()) | {"Outras Despesas", "Receitas"})
+
+    # Para evitar alterar o dataframe principal de forma inesperada, editamos uma cópia.
+    classificacao = df[["Categoria_Automatica", "Categoria"]].copy()
+    classificacao["Índice"] = classificacao.index
+    classificacao = classificacao.drop_duplicates(subset=["Categoria_Automatica", "Categoria"])
 
     st.dataframe(
-        df_orc.style.format({
-            'Orçado (R$)': 'R$ {:,.2f}',
-            'Realizado (R$)': 'R$ {:,.2f}',
-            'Diferença (R$)': 'R$ {:,.2f}',
-            'Atingido (%)': '{:.1f}%'
-        }),
+        classificacao.sort_values("Categoria_Automatica"),
         use_container_width=True,
         hide_index=True
     )
 
-
-# ------------------------------------------
-# ABA 5: TABELA DETALHADA E EXPORTAÇÃO
-# ------------------------------------------
-with aba5:
-    st.subheader("📋 Tabela Completa de Lançamentos Filtrados")
-    st.markdown(f"Total de **{len(df_filtrado)} lançamentos** encontrados com os filtros aplicados.")
-
-    st.dataframe(
-        df_filtrado[['Data', 'Tipo', 'Categoria', 'Descrição', 'Razão Social', 'CNPJ/CPF', 'Valor']],
-        use_container_width=True,
-        hide_index=True
+    st.markdown("### Como melhorar a classificação")
+    st.info(
+        "Se o seu banco usar nomes muito específicos, me envie um exemplo dos lançamentos. "
+        "As regras REGRAS no início do código podem ser ampliadas com fornecedores, CNPJs e palavras-chave."
     )
 
-    st.markdown("---")
-    st.subheader("📥 Exportação de Relatórios")
+# ============================================================
+# DADOS
+# ============================================================
+with tab_dados:
+    st.subheader("📋 Dados completos")
 
-    col_exp1, col_exp2 = st.columns(2)
+    st.dataframe(df_filtrado, use_container_width=True, hide_index=True)
 
-    buffer_excel = io.BytesIO()
-    with pd.ExcelWriter(buffer_excel, engine='openpyxl') as writer:
-        df_filtrado.to_excel(writer, sheet_name='Extrato Filtrado', index=False)
-        dre_saidas.to_excel(writer, sheet_name='Resumo Despesas', index=False)
-        dre_entradas.to_excel(writer, sheet_name='Resumo Receitas', index=False)
+    # Exportação Excel
+    excel_buffer = io.BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+        df_filtrado.to_excel(writer, index=False, sheet_name="Lancamentos")
+        if not df_filtrado.empty:
+            (
+                df_filtrado.groupby("Categoria")["Valor_Absoluto"]
+                .sum()
+                .reset_index()
+                .sort_values("Valor_Absoluto", ascending=False)
+                .to_excel(writer, index=False, sheet_name="Por Categoria")
+            )
 
-    col_exp1.download_button(
-        label="🟢 Baixar Relatório em Excel (.xlsx)",
-        data=buffer_excel.getvalue(),
-        file_name=f"relatorio_condominio_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+    st.download_button(
+        "⬇️ Baixar Excel filtrado",
+        data=excel_buffer.getvalue(),
+        file_name="relatorio_condominio_filtrado.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    buffer_csv = df_filtrado.to_csv(index=False, sep=';', encoding='utf-8-sig')
-    col_exp2.download_button(
-        label="📄 Baixar Extrato em CSV (.csv)",
-        data=buffer_csv,
-        file_name=f"extrato_condominio_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+    csv_data = df_filtrado.to_csv(index=False, sep=";", encoding="utf-8-sig")
+    st.download_button(
+        "⬇️ Baixar CSV filtrado",
+        data=csv_data,
+        file_name="relatorio_condominio_filtrado.csv",
         mime="text/csv"
     )
+
+# ============================================================
+# RODAPÉ
+# ============================================================
+st.markdown("---")
+st.caption(
+    "San Remo • Gestão Financeira Condominial | "
+    "Classificação automática baseada nos dados importados. "
+    "Sempre confira a classificação antes de usar os números em prestação de contas."
+)
